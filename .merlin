@@ -1,0 +1,12 @@
+PKG irmin
+PKG cohttp
+PKG lwt
+PKG lwt.ppx
+PKG mirage
+PKG mirage-xen
+PKG mirage-types
+PKG mirage-http
+PKG irmin-arp
+PKG mirage-nat
+PKG mirage-bootvar
+PKG x509
