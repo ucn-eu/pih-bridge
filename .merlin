@@ -8,5 +8,4 @@ PKG mirage-types
 PKG mirage-http
 PKG irmin-arp
 PKG mirage-nat
-PKG mirage-bootvar
 PKG x509

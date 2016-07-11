@@ -7,7 +7,7 @@ let console = default_console
 
 (* 0 is usually the bridge with other stuff on it *)
 (* so the "first" vif offered to us will be a "management" interface *)
-let stack = direct_stackv4_with_dhcp console (netif "0")
+let stack = direct_stackv4_with_default_ipv4 console (netif "0")
 (*let stack = generic_stackv4 default_console tap0*)
 let http = http_server (conduit_direct ~tls:true stack)
 

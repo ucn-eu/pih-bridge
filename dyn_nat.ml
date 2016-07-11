@@ -194,16 +194,19 @@ let start c _random _clock pri sec http keys =
   in
 
   (* get network configuration from bootvars *)
+  (*
   Bootvar.create () >>= function
   | `Error s -> fail (Failure ("error while create bootvar: " ^ s))
   | `Ok bootvar ->
      let of_opt = function | None -> "none" | Some k -> k in
-     let try_bootvar key = Ipaddr.V4.of_string_exn (Bootvar.get bootvar key |> of_opt) in
-     let internal_ip = try_bootvar "internal_ip" in
-     let internal_netmask = try_bootvar "internal_netmask" in
-     let external_ip = try_bootvar "external_ip" in
-     let external_netmask = try_bootvar "external_netmask" in
-     let external_gateway = try_bootvar "external_gateway" in
+     let try_bootvar key = Ipaddr.V4.of_string_exn (Bootvar.get bootvar key |> of_opt) in *)
+  let conf = Bridge_config.config () in
+  let try_config key = Ipaddr.V4.of_string_exn (List.assoc key conf) in
+  let internal_ip = try_config "internal_ip" in
+  let internal_netmask = try_config "internal_netmask" in
+  let external_ip = try_config "external_ip" in
+  let external_netmask = try_config "external_netmask" in
+  let external_gateway = try_config "external_gateway" in
 
   (* initialize interfaces *)
   let%lwt nf1 = or_error c "primary interface" ETH.connect pri in
