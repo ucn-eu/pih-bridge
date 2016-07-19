@@ -5,7 +5,7 @@ open Lwt
 let src_log = Logs.Src.create "NAT"
 module Log = (val Logs.src_log src_log : Logs.LOG)
 
-module Main (C: CONSOLE) (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
+module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     (PRI: NETWORK) (SEC: NETWORK)
     (HTTP: Cohttp_lwt.Server) (KEYS: KV_RO)= struct
 
@@ -129,7 +129,7 @@ module Main (C: CONSOLE) (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
       else return_unit
 
 
-  let nat c external_ip internal_ip nat_table (direction : direction)
+  let nat external_ip internal_ip nat_table (direction : direction)
       in_queue out_push =
     let rec aux frame =
       let open Mirage_nat in
@@ -198,15 +198,13 @@ module Main (C: CONSOLE) (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     Lwt.return conf
 
 
-  let start c _clock _time pri sec http keys =
+  let start _clock _time pri sec http keys =
     Logs.(set_level (Some Info));
     Logs_reporter.(create () |> run) @@ fun () ->
-
 
     tls_init keys >>= fun cfg ->
     let tcp = `TCP 4433 in
     let tls = `TLS (cfg, tcp) in
-
 
     let (pri_in_queue, pri_in_push) = Lwt_stream.create () in
     let (pri_out_queue, pri_out_push) = Lwt_stream.create () in
@@ -214,11 +212,11 @@ module Main (C: CONSOLE) (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     let (sec_out_queue, sec_out_push) = Lwt_stream.create () in
 
     (* or_error brazenly stolen from netif-forward *)
-    let or_error c name fn t =
+    let or_error name fn t =
       fn t
       >>= function
       | `Error e -> fail (Failure ("error starting " ^ name))
-      | `Ok t -> C.log_s c (Printf.sprintf "%s connected." name) >>= fun () ->
+      | `Ok t -> Log.info (fun f -> f "%s connected." name);
                  return t
     in
 
@@ -231,15 +229,15 @@ module Main (C: CONSOLE) (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     let external_gateway = fix @@ Key_gen.external_gateway () in
 
     (* initialize interfaces *)
-    or_error c "primary interface" ETH.connect pri >>= fun ethif1 ->
-    or_error c "secondary interface" ETH.connect sec >>= fun ethif2 ->
+    or_error "primary interface" ETH.connect pri >>= fun ethif1 ->
+    or_error "secondary interface" ETH.connect sec >>= fun ethif2 ->
 
-    or_error c "primary arp" A.connect ethif1 >>= fun arp1 ->
-    or_error c "primary arp" A.connect ethif2 >>= fun arp2 ->
+    or_error "primary arp" A.connect ethif1 >>= fun arp1 ->
+    or_error "primary arp" A.connect ethif2 >>= fun arp2 ->
 
     (* set up ipv4 on interfaces so ARP will be answered *)
-    or_error c "ip for primary interface" (I.connect ethif1) arp1 >>= fun ext_i ->
-    or_error c "ip for secondary interface" (I.connect ethif2) arp2 >>= fun int_i ->
+    or_error "ip for primary interface" (I.connect ethif1) arp1 >>= fun ext_i ->
+    or_error "ip for secondary interface" (I.connect ethif2) arp2 >>= fun int_i ->
     I.set_ip ext_i external_ip >>= fun () ->
     I.set_ip_netmask ext_i external_netmask >>= fun () ->
     I.set_ip int_i internal_ip >>= fun () ->
@@ -268,13 +266,13 @@ module Main (C: CONSOLE) (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
 
         (* for packets received on xenbr1 ("internal"), rewrite source address/port
        before sending packets out the primary interface *)
-        (nat c (Ipaddr.V4 external_ip) (Ipaddr.V4 internal_ip) nat_t Source sec_in_queue pri_out_push);
+        (nat (Ipaddr.V4 external_ip) (Ipaddr.V4 internal_ip) nat_t Source sec_in_queue pri_out_push);
 
         (* for packets received on the first interface (xenbr0/br0 in examples,
        which is an "external" world-facing interface),
        rewrite destination addresses/ports before sending packet out the second
        interface *)
-        (nat c (Ipaddr.V4 external_ip) (Ipaddr.V4 internal_ip) nat_t Destination pri_in_queue sec_out_push);
+        (nat (Ipaddr.V4 external_ip) (Ipaddr.V4 internal_ip) nat_t Destination pri_in_queue sec_out_push);
 
         (* packet output *)
         (*(send_packets c pri arp1 pri_out_queue (Some (Ipaddr.V4 external_gateway)));
