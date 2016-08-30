@@ -9,5 +9,7 @@ PKG mirage-nat
 PKG x509
 PKG mirage-logs
 PKG ezjsonm
+PKG pih-store
 
+S .
 B _build

@@ -7,7 +7,8 @@ module Log = (val Logs.src_log src_log : Logs.LOG)
 
 module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     (PRI: NETWORK) (SEC: NETWORK)
-    (HTTP: Cohttp_lwt.Server) (KEYS: KV_RO)= struct
+    (HTTP: Cohttp_lwt.Server) (KEYS: KV_RO)
+    (CONDUIT: Conduit_mirage.S) (RESOLVER: Resolver_lwt.S) = struct
 
   module Logs_reporter = Mirage_logs.Make(Clock)
 
@@ -20,7 +21,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     let now () = Clock.time () |> Int64.of_float
   end
 
-  module Nat_rewrite = Mirage_nat_hashtable.Make(Nat_clock)(Time)
+  module Nat_rewrite = Mirage_nat_irmin.Make(Nat_clock)
 
   let inspect_frame ~fname frame =
     let to_string_mac b = b |> Macaddr.of_bytes_exn |> Macaddr.to_string in
@@ -225,8 +226,11 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
       match direction, f with
       | Destination, Untranslated ->
          insert_new_entry nat_table frame internal_ip aux
-      | _, (Translated dst) ->
-        return (out_push (Some (dst, frame)))
+      | Destination, (Translated dst) ->
+         (* heartbeat to demonstrate liveness *)
+         return (out_push (Some (dst, frame)))
+      | Source, (Translated dst) ->
+         return (out_push (Some (dst, frame)))
       | Source, Untranslated ->
          Log.info (fun f -> f "add_nat_traffic");
          inspect_frame ~fname:"nat" frame;
@@ -277,19 +281,19 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
 
   module X509 = Tls_mirage.X509(KEYS)(Clock)
 
+
   let tls_init kv =
     X509.certificate kv `Default >>= fun cert ->
     let conf = Tls.Config.server ~certificates:(`Single cert) () in
     Lwt.return conf
 
-
-  let start _clock _time pri sec http keys =
+  let start _clock _time pri sec http keys conduit resolver =
     Logs.(set_level (Some Info));
     Logs_reporter.(create () |> run) @@ fun () ->
 
     tls_init keys >>= fun cfg ->
-    let tcp = `TCP 4433 in
-    let tls = `TLS (cfg, tcp) in
+    let tcp = `TCP 8080 in
+    let tls = `TLS (cfg, `TCP 8443) in
 
     let (pri_in_queue, pri_in_push) = Lwt_stream.create () in
     let (pri_out_queue, pri_out_push) = Lwt_stream.create () in
@@ -306,12 +310,16 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     in
 
     (* get network configuration from bootvars *)
-    let fix = Ipaddr.V4.of_string_exn in
-    let internal_ip = fix @@ Key_gen.internal_ip () in
-    let internal_netmask = fix @@ Key_gen.internal_netmask () in
-    let external_ip = fix @@ Key_gen.external_ip () in
-    let external_netmask = fix @@ Key_gen.external_netmask () in
-    let external_gateway = fix @@ Key_gen.external_gateway () in
+    let addr = Ipaddr.V4.of_string_exn in
+    let internal_ip = addr @@ Key_gen.internal_ip () in
+    let internal_netmask = addr @@ Key_gen.internal_netmask () in
+    let external_ip = addr @@ Key_gen.external_ip () in
+    let external_netmask = addr @@ Key_gen.external_netmask () in
+    let external_gateway = addr @@ Key_gen.external_gateway () in
+
+    let operation_ip = Key_gen.operation_ip () in
+    let gatekeeper_ip = Key_gen.gatekeeper_ip () in
+    let gatekeeper_port = Key_gen.gatekeeper_port () in
 
     (* initialize interfaces *)
     or_error "primary interface" ETH.connect pri >>= fun ethif1 ->
@@ -337,12 +345,37 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
       let sec_prefix = check_prefix internal_netmask internal_ip in
       with_filter_push sec_prefix sec_in_push in
 
+    (*
+    let heartbeat_liveness ip =
+      let module Client = Cohttp_mirage.Client in
+      let ctx = Client.ctx resolver conduit in
+      let host = gatekeeper_ip
+      and port = gatekeeper_port in
+      let path = Printf.sprintf "/alive/%s" ip in
+      let uri = Uri.make ~scheme:"http" ~host ~port ~path () in
+      Client.get ~ctx uri >>= fun (res, _) ->
+      let status = Cohttp.Response.status res in
+      if status = `OK then return_unit
+      else begin
+          let s = Cohttp.Code.string_of_status status in
+          Log.warn (fun f -> f "heartbeat liveness %s: %s" ip s);
+          return_unit end in
+
+    let rec heartbeat_loop () =
+      OS.Time.sleep 15.0 >>= fun () ->
+      heartbeat_liveness operation_ip >>= fun () ->
+      heartbeat_loop () in *)
+
     let () =
       Lwt.async_exception_hook := (fun exn ->
         Log.err (fun f -> f "async exception: %s" (Printexc.to_string exn))) in
 
     (* TODO: provide hooks for updates to/dump of this *)
-    Nat_rewrite.empty () >>= fun nat_t ->
+    let persist_host = Key_gen.persist_ip () in
+    let persist_port = Key_gen.persist_port () |> int_of_string in
+    let persist_uri = Uri.make ~scheme:"http" ~host:persist_host ~port:persist_port () in
+    let conf = Mirage_nat_irmin.({resolver; conduit; uri = persist_uri; owner = "ucn.bridge"}) in
+    Nat_rewrite.empty conf >>= fun nat_t ->
 
     Lwt.choose [
         (* packet intake *)
@@ -369,7 +402,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
         send_packets_ip ext_i pri_out_queue;
         send_packets_ip int_i sec_out_queue;
 
-        http tls @@ insert_entry external_ip ()
+        http tcp @@ insert_entry external_ip ();
       ]
 
   end
