@@ -191,7 +191,8 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
              let internal_lookup = external_lookup in
              Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
              >>= fun _ -> HTTP.respond ~headers ~status:`OK ~body ()
-          | Some (_, internal_lookup) ->
+          | Some (_, (mapping_src, mapping_dst)) ->
+             let internal_lookup = mapping_dst, mapping_src in
              Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
              >>= fun _ -> HTTP.respond ~headers ~status:`OK ~body ())
           (fun exn ->
