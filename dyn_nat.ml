@@ -120,8 +120,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
      real ip/port of the unikernel behind the NAT,
      so if a request is allowed after identify authentication, a ip/port pair on
      the external interface should be returned as connect point *)
-  let insert_entry external_ip () =
-    (*TODO: auth the insert request*)
+  let manage_entry (nat_t, external_ip) () =
     let callback (_,cid) req body =
       let uri = Cohttp.Request.uri req in
       let cid = Cohttp.Connection.to_string cid in
@@ -150,6 +149,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
             (Ipaddr.V4.to_string     ip)     port
             (Ipaddr.V4.to_string dst_ip) dst_port);
           (ip, port), (dst_ip, dst_port)) >>= fun (src, dst) ->
+
           let nat_dst_port = get_fresh_port !external_ports in
           add_new_entry ((src, (external_ip, nat_dst_port)), dst);
           let body = Ezjsonm.([
@@ -162,6 +162,42 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
           (fun exn ->
            let body = Printexc.to_string exn in
            HTTP.respond_error ~headers ~status:`Bad_request ~body ())
+      else if path = "/remove" then
+        Cohttp_lwt_body.to_string body >>= fun b ->
+        Lwt.catch (fun () ->
+          let req_body = Ezjsonm.(from_string b |> value |> get_dict) in
+          let src_ip =
+            List.assoc "src_ip" req_body
+            |> Ezjsonm.get_string
+            |> Ipaddr.of_string_exn in
+          let src_port =
+            List.assoc "src_port" req_body
+            |> Ezjsonm.get_int in
+          let dst_ip =
+            List.assoc "dst_ip" req_body
+            |> Ezjsonm.get_string
+            |> Ipaddr.of_string_exn in
+          let dst_port =
+            List.assoc "dst_port" req_body
+            |> Ezjsonm.get_int in
+          Log.info (fun f ->
+            f "entry %s:%d -> %s:%d to be removed"
+            (Ipaddr.to_string src_ip) src_port
+            (Ipaddr.to_string dst_ip) dst_port);
+          return @@ ((src_ip, src_port), (dst_ip, dst_port)) >>= fun (source, destination) ->
+          let external_lookup = source, destination in
+          Nat_rewrite.Table.lookup nat_t Mirage_nat.Tcp ~source ~destination >>= function
+          | None ->
+             let internal_lookup = external_lookup in
+             Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
+             >>= fun _ -> HTTP.respond ~headers ~status:`OK ~body ()
+          | Some (_, internal_lookup) ->
+             Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
+             >>= fun _ -> HTTP.respond ~headers ~status:`OK ~body ())
+          (fun exn ->
+           let body = Printexc.to_string exn in
+           HTTP.respond_error ~headers ~status:`Bad_request ~body ())
+
       else
         HTTP.respond_error ~headers ~status:`Not_found ~body:"" ()
     in
@@ -402,7 +438,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
         send_packets_ip ext_i pri_out_queue;
         send_packets_ip int_i sec_out_queue;
 
-        http tcp @@ insert_entry external_ip ();
+        http tcp @@ manage_entry (nat_t, external_ip) ();
       ]
 
   end
