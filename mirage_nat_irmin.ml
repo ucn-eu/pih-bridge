@@ -57,13 +57,13 @@ module Storage (Clock: CLOCK) : sig
     let root = string_of_protocol prot in
     let expiration = Int64.(add (Clock.now ()) timeout |> to_string) in
 
-    let inbnd_dir = root :: ["inbound"] in
-    let inbnd_path = to_entry trans.external_lookup trans.external_mapping in
-    let inbnd_path = inbnd_dir @ inbnd_path in
-
     let outbnd_dir = root :: ["outbound"] in
     let outbnd_path = to_entry trans.internal_lookup trans.internal_mapping in
     let outbnd_path = outbnd_dir @ outbnd_path in
+
+    let inbnd_dir = root :: ["inbound"] in
+    let inbnd_path = to_entry trans.external_lookup trans.external_mapping in
+    let inbnd_path = inbnd_dir @ inbnd_path in
 
     S.create t inbnd_path expiration >|= (function
     | Error exn ->
