@@ -106,8 +106,13 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     let nl = List.filter (fun (k,_) -> k <> pair) !new_entries in
     new_entries := nl
 
-  let is_new_entry pair =
-    List.mem_assoc pair !new_entries
+  let remove_entry pair =
+    Log.info (fun f -> f "remove entry from allowed list");
+    let nl = List.filter (fun (k,_) -> k <> pair) !new_entries in
+    new_entries := nl
+
+  let is_new_entry ((src_ip, _), dst) =
+    List.mem_assoc (src_ip, dst) !new_entries
 
 
   let headers = Cohttp.Header.of_list [
@@ -134,9 +139,9 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
             List.assoc "ip" req_body
             |> Ezjsonm.get_string
             |> Ipaddr.V4.of_string_exn in
-          let port =
+          (*let port =
             List.assoc "port" req_body
-            |> Ezjsonm.get_int in
+            |> Ezjsonm.get_int in*)
           let dst_ip =
             List.assoc "dst_ip" req_body
             |> Ezjsonm.get_string
@@ -145,13 +150,13 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
             List.assoc "dst_port" req_body
             |> Ezjsonm.get_int in
           Log.info (fun f ->
-            f "new entry %s:%d -> %s:%d to be inserted"
-            (Ipaddr.V4.to_string     ip)     port
+            f "new entry %s:* -> %s:%d to be inserted"
+            (Ipaddr.V4.to_string     ip)
             (Ipaddr.V4.to_string dst_ip) dst_port);
-          (ip, port), (dst_ip, dst_port)) >>= fun (src, dst) ->
+          ip, (dst_ip, dst_port)) >>= fun (src_ip, final_dst) ->
 
           let nat_dst_port = get_fresh_port !external_ports in
-          add_new_entry ((src, (external_ip, nat_dst_port)), dst);
+          add_new_entry ((src_ip, (external_ip, nat_dst_port)), final_dst);
           let body = Ezjsonm.([
             "ip",   external_ip |> Ipaddr.V4.to_string |> string;
             "port", nat_dst_port |> int]
@@ -169,32 +174,41 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
           let src_ip =
             List.assoc "src_ip" req_body
             |> Ezjsonm.get_string
-            |> Ipaddr.of_string_exn in
-          let src_port =
+            |> Ipaddr.V4.of_string_exn in
+          (*let src_port =
             List.assoc "src_port" req_body
-            |> Ezjsonm.get_int in
+            |> Ezjsonm.get_int in*)
           let dst_ip =
             List.assoc "dst_ip" req_body
             |> Ezjsonm.get_string
-            |> Ipaddr.of_string_exn in
+            |> Ipaddr.V4.of_string_exn in
           let dst_port =
             List.assoc "dst_port" req_body
             |> Ezjsonm.get_int in
           Log.info (fun f ->
-            f "entry %s:%d -> %s:%d to be removed"
-            (Ipaddr.to_string src_ip) src_port
-            (Ipaddr.to_string dst_ip) dst_port);
-          return @@ ((src_ip, src_port), (dst_ip, dst_port)) >>= fun (source, destination) ->
-          let external_lookup = source, destination in
-          Nat_rewrite.Table.lookup nat_t Mirage_nat.Tcp ~source ~destination >>= function
-          | None ->
-             let internal_lookup = external_lookup in
-             Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
-             >>= fun _ -> HTTP.respond ~headers ~status:`OK ~body ()
-          | Some (_, (mapping_src, mapping_dst)) ->
-             let internal_lookup = mapping_dst, mapping_src in
-             Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
-             >>= fun _ -> HTTP.respond ~headers ~status:`OK ~body ())
+            f "entry %s:* -> %s:%d to be removed"
+            (Ipaddr.V4.to_string src_ip)
+            (Ipaddr.V4.to_string dst_ip) dst_port);
+          return @@ (src_ip, (dst_ip, dst_port)) >>= fun (src_ip, dst) ->
+
+          remove_entry (src_ip, dst);
+          let src_ip = Ipaddr.V4 src_ip in
+          let destination = Ipaddr.V4 (fst dst), snd dst in
+          Nat_rewrite.Table.list_redirect_ports nat_t (src_ip, destination) >>= fun ports ->
+          Lwt_list.iter_s (fun src_port ->
+            let source = src_ip, src_port in
+            let external_lookup = (src_ip, src_port), destination in
+            Nat_rewrite.Table.lookup nat_t Mirage_nat.Tcp ~source ~destination >>= function
+            | None ->
+               let internal_lookup = external_lookup in
+               Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
+               >|= ignore
+            | Some (_, (mapping_src, mapping_dst)) ->
+               let internal_lookup = mapping_dst, mapping_src in
+               Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
+               >|= ignore) ports
+          >>= fun _ -> Nat_rewrite.Table.remove_redirect_ports nat_t (src_ip, destination)
+          >>= fun () -> HTTP.respond ~headers ~status:`OK ~body ())
           (fun exn ->
            let body = Printexc.to_string exn in
            HTTP.respond_error ~headers ~status:`Bad_request ~body ())
@@ -209,9 +223,9 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     HTTP.make ~conn_closed ~callback ()
 
 
-  let stubborn_insert_redirect t frame pair internal_ip =
+  let stubborn_insert_redirect t frame ((src_ip, src_port), dst) internal_ip =
     let other_xl_ip = internal_ip in
-    let final_dst_ip, final_dst_port = List.assoc pair !new_entries in
+    let final_dst_ip, final_dst_port = List.assoc (src_ip, dst) !new_entries in
     let rec aux () =
       let other_xl_port = get_fresh_port !internal_ports in
       let other_endp = other_xl_ip, other_xl_port
@@ -219,8 +233,10 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
       let open Nat_rewrite in
       add_redirect t frame other_endp final_endp >>= function
       | Ok ->
-         entry_inserted pair;
-         return_unit
+         let src = Ipaddr.V4 src_ip, src_port in
+         let dst = Ipaddr.V4 (fst dst), snd dst in
+         Nat_rewrite.Table.add_redirect_port t (src, dst)
+         (*entry_inserted pair;*)
       | Overlap -> aux ()
       | Unparseable -> Lwt.fail (Failure "unparseable frame") in
     aux ()

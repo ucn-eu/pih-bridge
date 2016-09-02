@@ -37,6 +37,9 @@ type storage_config = {
 
 module Storage (Clock: CLOCK) : sig
     include Mirage_nat.Lookup with type config = storage_config
+    val add_redirect_port: t -> mapping -> unit Lwt.t
+    val list_redirect_ports: t -> Ipaddr.t * endpoint -> port list Lwt.t
+    val remove_redirect_ports: t -> Ipaddr.t * endpoint -> unit Lwt.t
   end = struct
 
   let src = Logs.Src.create "nat-irmin-tbl" ~doc:"Mirage NAT with Irmin Http backend"
@@ -121,6 +124,39 @@ module Storage (Clock: CLOCK) : sig
       | Ok files -> delete_files parent files) paths
     >>= fun () -> return t
 
+
+  let dir_of_semi_mapping (src_ip, dst) =
+    let parent = Printf.sprintf "%s_%s" (Ipaddr.to_string src_ip) (string_of_endpoint dst) in
+    [parent]
+
+  let key_of_redirect_port ((src_ip, src_port), dst) =
+    dir_of_semi_mapping (src_ip, dst) @ [src_port |> string_of_int]
+
+  let add_redirect_port t mapping =
+    let key = key_of_redirect_port mapping in
+    S.update t key "" >>= function
+    | Ok () -> return_unit
+    | Error exn ->
+       Log.err (fun f -> f "add_redirect_port: %s" (Printexc.to_string exn));
+       return_unit
+
+
+  let list_redirect_ports t (ip, dst) =
+    let parent = dir_of_semi_mapping (ip, dst) in
+    S.list t ~parent () >>= function
+    | Ok ports -> return @@ List.map int_of_string ports
+    | Error exn ->
+       Log.err (fun f -> f "list_redirect_ports: %s" (Printexc.to_string exn));
+       return_nil
+
+
+  let remove_redirect_ports t (ip, dst) =
+    let key = dir_of_semi_mapping (ip, dst) in
+    S.remove_rec t key >>= function
+    | Ok () -> return_unit
+    | Error exn ->
+       Log.err (fun f -> f "remove_redirect_ports: %s" (Printexc.to_string exn));
+       return_unit
 end
 
 
