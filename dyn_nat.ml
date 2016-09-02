@@ -95,6 +95,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     (* TODO: connection tracking logic *)
     stubborn_insert table frame ip (get_fresh_port !external_ports)
 
+  (*
   let new_entries = ref []
 
   let add_new_entry (src_dst_pair, dst) =
@@ -112,7 +113,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     new_entries := nl
 
   let is_new_entry ((src_ip, _), dst) =
-    List.mem_assoc (src_ip, dst) !new_entries
+    List.mem_assoc (src_ip, dst) !new_entries *)
 
 
   let headers = Cohttp.Header.of_list [
@@ -138,27 +139,27 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
           let ip =
             List.assoc "ip" req_body
             |> Ezjsonm.get_string
-            |> Ipaddr.V4.of_string_exn in
+            |> Ipaddr.of_string_exn in
           (*let port =
             List.assoc "port" req_body
             |> Ezjsonm.get_int in*)
           let dst_ip =
             List.assoc "dst_ip" req_body
             |> Ezjsonm.get_string
-            |> Ipaddr.V4.of_string_exn in
+            |> Ipaddr.of_string_exn in
           let dst_port =
             List.assoc "dst_port" req_body
             |> Ezjsonm.get_int in
           Log.info (fun f ->
             f "new entry %s:* -> %s:%d to be inserted"
-            (Ipaddr.V4.to_string     ip)
-            (Ipaddr.V4.to_string dst_ip) dst_port);
+            (Ipaddr.to_string     ip)
+            (Ipaddr.to_string dst_ip) dst_port);
           ip, (dst_ip, dst_port)) >>= fun (src_ip, final_dst) ->
 
           let nat_dst_port = get_fresh_port !external_ports in
-          add_new_entry ((src_ip, (external_ip, nat_dst_port)), final_dst);
+          Nat_rewrite.Table.add_entry nat_t ((src_ip, (external_ip, nat_dst_port)), final_dst) >>= fun () ->
           let body = Ezjsonm.([
-            "ip",   external_ip |> Ipaddr.V4.to_string |> string;
+            "ip",   external_ip |> Ipaddr.to_string |> string;
             "port", nat_dst_port |> int]
              |> dict
              |> to_string
@@ -174,27 +175,25 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
           let src_ip =
             List.assoc "src_ip" req_body
             |> Ezjsonm.get_string
-            |> Ipaddr.V4.of_string_exn in
+            |> Ipaddr.of_string_exn in
           (*let src_port =
             List.assoc "src_port" req_body
             |> Ezjsonm.get_int in*)
           let dst_ip =
             List.assoc "dst_ip" req_body
             |> Ezjsonm.get_string
-            |> Ipaddr.V4.of_string_exn in
+            |> Ipaddr.of_string_exn in
           let dst_port =
             List.assoc "dst_port" req_body
             |> Ezjsonm.get_int in
           Log.info (fun f ->
             f "entry %s:* -> %s:%d to be removed"
-            (Ipaddr.V4.to_string src_ip)
-            (Ipaddr.V4.to_string dst_ip) dst_port);
-          return @@ (src_ip, (dst_ip, dst_port)) >>= fun (src_ip, dst) ->
+            (Ipaddr.to_string src_ip)
+            (Ipaddr.to_string dst_ip) dst_port);
+          return @@ (src_ip, (dst_ip, dst_port)) >>= fun (src_ip, destination) ->
 
-          remove_entry (src_ip, dst);
-          let src_ip = Ipaddr.V4 src_ip in
-          let destination = Ipaddr.V4 (fst dst), snd dst in
-          Nat_rewrite.Table.list_redirect_ports nat_t (src_ip, destination) >>= fun ports ->
+          Nat_rewrite.Table.remove_entry nat_t (src_ip, destination) >>= fun () ->
+          Nat_rewrite.Table.list_source_ports nat_t (src_ip, destination) >>= fun ports ->
           Lwt_list.iter_s (fun src_port ->
             let source = src_ip, src_port in
             let external_lookup = (src_ip, src_port), destination in
@@ -207,7 +206,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
                let internal_lookup = mapping_dst, mapping_src in
                Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
                >|= ignore) ports
-          >>= fun _ -> Nat_rewrite.Table.remove_redirect_ports nat_t (src_ip, destination)
+          >>= fun _ -> Nat_rewrite.Table.remove_source_ports nat_t (src_ip, destination)
           >>= fun () -> HTTP.respond ~headers ~status:`OK ~body ())
           (fun exn ->
            let body = Printexc.to_string exn in
@@ -223,19 +222,15 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     HTTP.make ~conn_closed ~callback ()
 
 
-  let stubborn_insert_redirect t frame ((src_ip, src_port), dst) internal_ip =
+  let stubborn_insert_redirect t frame (src, dst) internal_ip final_endp =
     let other_xl_ip = internal_ip in
-    let final_dst_ip, final_dst_port = List.assoc (src_ip, dst) !new_entries in
     let rec aux () =
       let other_xl_port = get_fresh_port !internal_ports in
-      let other_endp = other_xl_ip, other_xl_port
-      and final_endp = Ipaddr.V4 final_dst_ip, final_dst_port in
+      let other_endp = other_xl_ip, other_xl_port in
       let open Nat_rewrite in
       add_redirect t frame other_endp final_endp >>= function
       | Ok ->
-         let src = Ipaddr.V4 src_ip, src_port in
-         let dst = Ipaddr.V4 (fst dst), snd dst in
-         Nat_rewrite.Table.add_redirect_port t (src, dst)
+         Nat_rewrite.Table.add_source_port t (src, dst)
          (*entry_inserted pair;*)
       | Overlap -> aux ()
       | Unparseable -> Lwt.fail (Failure "unparseable frame") in
@@ -245,11 +240,15 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
   let insert_new_entry t frame int_ip fn =
     let eth_payload = Cstruct.shift frame Ethif_wire.sizeof_ethernet in
     let src_ip =
-      Ipv4_wire.get_ipv4_src eth_payload
-      |> Ipaddr.V4.of_int32 in
+      let addr =
+        Ipv4_wire.get_ipv4_src eth_payload
+        |> Ipaddr.V4.of_int32 in
+      Ipaddr.V4 addr in
     let dst_ip =
-      Ipv4_wire.get_ipv4_dst eth_payload
-      |> Ipaddr.V4.of_int32 in
+      let addr =
+        Ipv4_wire.get_ipv4_dst eth_payload
+        |> Ipaddr.V4.of_int32 in
+      Ipaddr.V4 addr in
     let proto = Ipv4_wire.get_ipv4_proto eth_payload in
     let ip_payload = Cstruct.shift eth_payload Ipv4_wire.sizeof_ipv4 in
     let src_port, dst_port =
@@ -263,9 +262,10 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     if src_port = -1 then Lwt.fail (Failure "src port unavailable")
     else
       let pair = (src_ip, src_port), (dst_ip, dst_port) in
-      if is_new_entry pair then
-        stubborn_insert_redirect t frame pair int_ip
-      else return_unit
+      Nat_rewrite.Table.read_entry t (src_ip, (dst_ip, dst_port)) >>= function
+      | None -> return_unit
+      | Some final_dst ->
+        stubborn_insert_redirect t frame pair int_ip final_dst
 
 
   let nat external_ip internal_ip nat_table (direction : direction)
@@ -455,7 +455,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
         send_packets_ip ext_i pri_out_queue;
         send_packets_ip int_i sec_out_queue;
 
-        http tcp @@ manage_entry (nat_t, external_ip) ();
+        http tcp @@ manage_entry (nat_t, Ipaddr.V4 external_ip) ();
       ]
 
   end
