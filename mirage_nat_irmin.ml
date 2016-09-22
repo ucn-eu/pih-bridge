@@ -2,6 +2,9 @@ open Lwt
 open Result
 open Mirage_nat
 
+let src = Logs.Src.create "nat-irmin-tbl" ~doc:"Mirage NAT with Irmin Http backend"
+module Log = (val Logs.src_log src : Logs.LOG)
+
 let string_of_protocol = function
   | Tcp -> "tcp"
   | Udp -> "udp"
@@ -12,8 +15,10 @@ let string_of_endpoint (ip, port) =
 let endpoint_of_string str =
   match Astring.String.cut ~sep:":" str with
   | None -> failwith (Printf.sprintf "endpoint_of_string %s" str)
-  | Some (ip, port) -> (Ipaddr.of_string_exn ip, int_of_string port)
-
+  | Some (ip, port) ->
+     try (Ipaddr.of_string_exn ip, int_of_string port)
+     with Failure fl -> Log.err (fun f -> f "endpoint_of_string %s: %s" fl str);
+                       failwith "wtf"
 
 let string_of_mapping (src, dst) =
   Printf.sprintf "%s_%s" (string_of_endpoint src) (string_of_endpoint dst)
@@ -33,9 +38,10 @@ type storage_config = {
     conduit  : Conduit_mirage.t;
     uri      : Uri.t;
     owner    : string;
+    now      : unit -> int64;
   }
 
-module Storage (Clock: CLOCK) : sig
+module Storage : sig
     include Mirage_nat.Lookup with type config = storage_config
 
     val add_source_port: t -> mapping -> unit Lwt.t
@@ -47,23 +53,22 @@ module Storage (Clock: CLOCK) : sig
     val remove_entry: t -> Ipaddr.t * endpoint -> unit Lwt.t
   end = struct
 
-  let src = Logs.Src.create "nat-irmin-tbl" ~doc:"Mirage NAT with Irmin Http backend"
-  module Log = (val Logs.src_log src : Logs.LOG)
   module S = Data_store
 
-  type t = S.t
+  type t = S.t * (unit -> int64)
 
   type config = storage_config
 
-  let empty {resolver; conduit; uri; owner} =
-    let time = fun () -> Clock.now () |> Int64.to_string in
+  let empty {resolver; conduit; uri; owner; now} =
+    let time = fun () -> now () |> Int64.to_string in
     let backend = `Http ((resolver, conduit, uri), owner) in
-    S.make ~backend ~time ()
+    S.make ~backend ~time () >>= fun s -> return (s, now)
 
+  let store_of_t (t, _) = t
 
-  let insert t timeout prot trans =
+  let insert (s, n) timeout prot trans =
     let root = string_of_protocol prot in
-    let expiration = Int64.(add (Clock.now ()) timeout |> to_string) in
+    let expiration = Int64.(add (n ()) timeout |> to_string) in
 
     let outbnd_dir = root :: ["outbound"] in
     let outbnd_path = to_entry trans.internal_lookup trans.internal_mapping in
@@ -73,21 +78,21 @@ module Storage (Clock: CLOCK) : sig
     let inbnd_path = to_entry trans.external_lookup trans.external_mapping in
     let inbnd_path = inbnd_dir @ inbnd_path in
 
-    S.create t inbnd_path expiration >|= (function
+    S.create s inbnd_path expiration >|= (function
     | Error exn ->
        let err = Printexc.to_string exn in
        Log.err (fun f -> f "insert %s failed: %s" (String.concat "/" inbnd_path) err);
     | Ok () -> ()) >>= fun () ->
 
-    S.create t outbnd_path expiration >|= (function
+    S.create s outbnd_path expiration >|= (function
     | Error exn ->
        Log.err (fun f -> f "insert failed: %s" (String.concat "/" inbnd_path));
     | Ok () -> ()) >>= fun () ->
 
-    return_some t
+    return_some (s, n)
 
 
-  let lookup t prot ~source ~destination =
+  let lookup (t, _) prot ~source ~destination =
     let root = string_of_protocol prot in
     let subdir = string_of_mapping (source, destination) in
     let paths = List.map (fun direction -> root :: direction :: [subdir]) ["inbound"; "outbound"] in
@@ -113,6 +118,7 @@ module Storage (Clock: CLOCK) : sig
 
 
   let delete t prot ~internal_lookup ~external_lookup =
+    let s = fst t in
     let root = string_of_protocol prot in
     let paths = [
       [root; "inbound"; string_of_mapping external_lookup];
@@ -121,10 +127,10 @@ module Storage (Clock: CLOCK) : sig
     let rec delete_files parent files =
       Lwt_list.iter_s (fun file ->
         let key = parent @ [file] in
-        S.remove t key >|= ignore) files in
+        S.remove s key >|= ignore) files in
 
     Lwt_list.iter_s (fun parent ->
-      S.list t ~parent () >>= function
+      S.list s ~parent () >>= function
       | Error _ -> return_unit
       | Ok files -> delete_files parent files) paths
     >>= fun () -> return t
@@ -141,7 +147,7 @@ module Storage (Clock: CLOCK) : sig
   let key_of_source_port ((src_ip, src_port), dst) =
     dir_of_source_ports (src_ip, dst) @ [src_port |> string_of_int]
 
-  let add_source_port t mapping =
+  let add_source_port (t, _) mapping =
     let key = key_of_source_port mapping in
     S.update t key "" >>= function
     | Ok () -> return_unit
@@ -149,7 +155,7 @@ module Storage (Clock: CLOCK) : sig
        Log.err (fun f -> f "add_source_port: %s" (Printexc.to_string exn));
        return_unit
 
-  let list_source_ports t (ip, dst) =
+  let list_source_ports (t, _) (ip, dst) =
     let parent = dir_of_source_ports (ip, dst) in
     S.list t ~parent () >>= function
     | Ok ports -> return @@ List.map int_of_string ports
@@ -157,7 +163,7 @@ module Storage (Clock: CLOCK) : sig
        Log.err (fun f -> f "list_source_ports: %s" (Printexc.to_string exn));
        return_nil
 
-  let remove_source_ports t (ip, dst) =
+  let remove_source_ports (t, _) (ip, dst) =
     let key = dir_of_source_ports (ip, dst) in
     S.remove_rec t key >>= function
     | Ok () -> return_unit
@@ -175,7 +181,7 @@ module Storage (Clock: CLOCK) : sig
     let file = Printf.sprintf "%s_%s" (Ipaddr.to_string src_ip) (string_of_endpoint dst) in
     dir_of_inserted_entris @ [file]
 
-  let add_entry t ((src_ip, dst), final_dst) =
+  let add_entry (t, _) ((src_ip, dst), final_dst) =
     let key = key_of_inserted_entry (src_ip, dst) in
     let value = string_of_endpoint final_dst in
     S.update t key value >>= function
@@ -184,7 +190,7 @@ module Storage (Clock: CLOCK) : sig
        Log.err (fun f -> f "add_entry: %s" (Printexc.to_string exn));
        return_unit
 
-  let read_entry t (src_ip, dst) =
+  let read_entry (t, _) (src_ip, dst) =
     let key = key_of_inserted_entry (src_ip, dst) in
     S.read t key >>= function
     | Ok value -> return_some @@ endpoint_of_string value
@@ -192,7 +198,7 @@ module Storage (Clock: CLOCK) : sig
        Log.info (fun f -> f "read_entry: no value");
        return_none
 
-  let remove_entry t (src_ip, dst) =
+  let remove_entry (t, _) (src_ip, dst) =
     let key = key_of_inserted_entry (src_ip, dst) in
     S.remove t key >>= function
     | Ok () -> return_unit
@@ -203,7 +209,7 @@ module Storage (Clock: CLOCK) : sig
 end
 
 
-module Make (Clock: CLOCK) = struct
-  module Table = Storage(Clock)
+module M = struct
+  module Table = Storage
   include Nat_rewrite.Make(Table)
 end

@@ -33,7 +33,7 @@ let keys = Key.[
   abstract persist_port;
 ]
 
-let main = foreign "Dyn_nat.Main" (clock @-> time @-> network @-> network
+let main = foreign "Dyn_nat.Main" (pclock @-> mclock @-> time @-> network @-> network
                                    @-> http @-> kv_ro
                                    @-> conduit @-> resolver @-> job)
 
@@ -79,7 +79,7 @@ let () =
     "mirage-profile";
     "ezjsonm"] in
   register ~packages ~libraries ~keys "pih-bridge" [
-    main $ default_clock $ default_time
+    main $ default_posix_clock $ default_monotonic_clock $ default_time
     $ primary_netif $ secondary_netif
     $ http $ key
     $ conduit_impl $ resolver_impl

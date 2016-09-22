@@ -5,23 +5,24 @@ open Lwt
 let src_log = Logs.Src.create "DYN_NAT"
 module Log = (val Logs.src_log src_log : Logs.LOG)
 
-module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
+module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     (PRI: NETWORK) (SEC: NETWORK)
     (HTTP: Cohttp_lwt.Server) (KEYS: KV_RO)
     (CONDUIT: Conduit_mirage.S) (RESOLVER: Resolver_lwt.S) = struct
 
-  module Logs_reporter = Mirage_logs.Make(Clock)
+  module Logs_reporter = Mirage_logs.Make(PClock)
 
   module ETH = Ethif.Make(PRI)
-  module A = Arpv4.Make(ETH)(Clock)(Time)
+  module A = Arpv4.Make(ETH)(MClock)(Time)
   module I = Ipv4.Make(ETH)(A)
   type direction = | Source | Destination
 
+  (* acutally no usage
   module Nat_clock = struct
-    let now () = Clock.time () |> Int64.of_float
-  end
+    let now () = 0L
+  end *)
 
-  module Nat_rewrite = Mirage_nat_irmin.Make(Nat_clock)
+  module Nat_rewrite = Mirage_nat_irmin.M
 
   let inspect_frame ~fname frame =
     let to_string_mac b = b |> Macaddr.of_bytes_exn |> Macaddr.to_string in
@@ -332,7 +333,7 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     Ipaddr.V4.Prefix.(mem dst subnet || mem src subnet)
 
 
-  module X509 = Tls_mirage.X509(KEYS)(Clock)
+  module X509 = Tls_mirage.X509(KEYS)(Pclock)
 
 
   let tls_init kv =
@@ -340,9 +341,9 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     let conf = Tls.Config.server ~certificates:(`Single cert) () in
     Lwt.return conf
 
-  let start _clock _time pri sec http keys conduit resolver =
+  let start pclock mclock _time pri sec http keys conduit resolver =
     Logs.(set_level (Some Info));
-    Logs_reporter.(create () |> run) @@ fun () ->
+    Logs_reporter.(create pclock |> run) @@ fun () ->
 
     tls_init keys >>= fun cfg ->
     let tcp = `TCP 8080 in
@@ -378,8 +379,9 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     or_error "primary interface" ETH.connect pri >>= fun ethif1 ->
     or_error "secondary interface" ETH.connect sec >>= fun ethif2 ->
 
-    or_error "primary arp" A.connect ethif1 >>= fun arp1 ->
-    or_error "secondary arp" A.connect ethif2 >>= fun arp2 ->
+    let arp_connect ethif = A.connect ethif mclock in
+    or_error "primary arp" arp_connect ethif1 >>= fun arp1 ->
+    or_error "secondary arp" arp_connect ethif2 >>= fun arp2 ->
 
     (* set up ipv4 on interfaces so ARP will be answered *)
     or_error "ip for primary interface" (I.connect ethif1) arp1 >>= fun ext_i ->
@@ -427,7 +429,8 @@ module Main (Clock: V1.CLOCK) (Time: V1_LWT.TIME)
     let persist_host = Key_gen.persist_ip () in
     let persist_port = Key_gen.persist_port () |> int_of_string in
     let persist_uri = Uri.make ~scheme:"http" ~host:persist_host ~port:persist_port () in
-    let conf = Mirage_nat_irmin.({resolver; conduit; uri = persist_uri; owner = "ucn.bridge"}) in
+    let now () = PClock.now_d_ps pclock |> Ptime.v |> Ptime.to_float_s |> Int64.of_float in
+    let conf = Mirage_nat_irmin.({resolver; conduit; uri = persist_uri; owner = "ucn.bridge"; now}) in
     Nat_rewrite.empty conf >>= fun nat_t ->
 
     Lwt.choose [
