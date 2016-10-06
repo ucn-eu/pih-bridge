@@ -64,6 +64,7 @@ let secondary_netif = (netif "2")
 let key = crunch "tls"
 
 let () =
+  let reporter = no_reporter in
   let packages = [
     "mirage-nat";
     "mirage-logs";
@@ -78,7 +79,7 @@ let () =
     "mirage-nat";
     "mirage-profile";
     "ezjsonm"] in
-  register ~packages ~libraries ~keys "pih-bridge" [
+  register ~packages ~libraries ~keys ~reporter "pih-bridge" [
     main $ default_posix_clock $ default_monotonic_clock $ default_time
     $ primary_netif $ secondary_netif
     $ http $ key

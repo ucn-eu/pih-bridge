@@ -5,12 +5,12 @@ open Lwt
 let src_log = Logs.Src.create "DYN_NAT"
 module Log = (val Logs.src_log src_log : Logs.LOG)
 
-module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
+module Main (PClock: PCLOCK) (MClock: MCLOCK) (Time: TIME)
     (PRI: NETWORK) (SEC: NETWORK)
     (HTTP: Cohttp_lwt.Server) (KEYS: KV_RO)
     (CONDUIT: Conduit_mirage.S) (RESOLVER: Resolver_lwt.S) = struct
 
-  module Logs_reporter = Mirage_logs.Make(PClock)
+  (*module Logs_reporter = Mirage_logs.Make(PClock)*)
 
   module ETH = Ethif.Make(PRI)
   module A = Arpv4.Make(ETH)(MClock)(Time)
@@ -72,14 +72,18 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     let compare = Pervasives.compare
   end)
 
-  let external_ports = ref PortSet.empty
-  let internal_ports = ref PortSet.empty
+  let external_ports = ref 1023
+  let internal_ports = ref 1023
   let get_fresh_port set =
+    incr set;
+    !set
+
+  (*let get_fresh_port set =
     let rec aux () =
       let p = Random.int 65535 in
       if p < 1024 || PortSet.mem p set then aux ()
       else p in
-    aux ()
+    aux ()*)
 
   let allow_nat_traffic table frame ip =
     let rec stubborn_insert table frame ip n =
@@ -88,13 +92,13 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
       let open Nat_rewrite in
       add_nat table frame (ip, n) >>= function
       | Ok ->
-         external_ports := PortSet.add n !external_ports;
+         (*external_ports := PortSet.add n !external_ports;*)
          Lwt.return (Some ())
       | Unparseable -> Lwt.return None
-      | Overlap -> stubborn_insert table frame ip (get_fresh_port !external_ports)
+      | Overlap -> stubborn_insert table frame ip (get_fresh_port external_ports)
     in
     (* TODO: connection tracking logic *)
-    stubborn_insert table frame ip (get_fresh_port !external_ports)
+    stubborn_insert table frame ip (get_fresh_port external_ports)
 
   (*
   let new_entries = ref []
@@ -121,19 +125,36 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     "Strict-Transport-Security", "max-age=31536000";
     "Access-Control-Allow-Origin", "*"]
 
+
+  let entry_op_cnt = ref 0
+  let tbl = Hashtbl.create 113
+  let get_counter () =
+    incr entry_op_cnt;
+    !entry_op_cnt
+  let pouch_timer mclock counter =
+    let time = MClock.elapsed_ns mclock in
+    if Hashtbl.mem tbl counter then
+      let start = Hashtbl.find tbl counter in
+      let span = Int64.sub time start in
+      Hashtbl.replace tbl counter span
+    else Hashtbl.add tbl counter time
+
   (* use Nat_rewrite.add_redirect, in the frame the dst should be
      a address-port pair of the external interface, while other_xl_ip/other_xl_port
      is a pair of the internal interface, and final_destination(ip/pair) is the
      real ip/port of the unikernel behind the NAT,
      so if a request is allowed after identify authentication, a ip/port pair on
      the external interface should be returned as connect point *)
-  let manage_entry (nat_t, external_ip) () =
+  let manage_entry (nat_t, external_ip, mclock) () =
     let callback (_,cid) req body =
       let uri = Cohttp.Request.uri req in
       let cid = Cohttp.Connection.to_string cid in
       Log.info (fun f -> f  "[%s] serving %s." cid (Uri.to_string uri));
       let path = Uri.path uri in
       if path = "/insert" then
+        let cnt = get_counter () in
+        let () = pouch_timer mclock cnt in
+
         Cohttp_lwt_body.to_string body >>= fun b ->
         Lwt.catch (fun () -> Lwt.wrap (fun () ->
           let req_body = Ezjsonm.(from_string b |> value |> get_dict) in
@@ -157,7 +178,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
             (Ipaddr.to_string dst_ip) dst_port);
           ip, (dst_ip, dst_port)) >>= fun (src_ip, final_dst) ->
 
-          let nat_dst_port = get_fresh_port !external_ports in
+          let nat_dst_port = get_fresh_port external_ports in
           Nat_rewrite.Table.add_entry nat_t ((src_ip, (external_ip, nat_dst_port)), final_dst) >>= fun () ->
           let body = Ezjsonm.([
             "ip",   external_ip |> Ipaddr.to_string |> string;
@@ -165,9 +186,11 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
              |> dict
              |> to_string
              |> Cohttp_lwt_body.of_string) in
+          let () = pouch_timer mclock cnt in
           HTTP.respond ~headers ~status:`OK ~body ())
           (fun exn ->
            let body = Printexc.to_string exn in
+           let () = pouch_timer mclock cnt in
            HTTP.respond_error ~headers ~status:`Bad_request ~body ())
       else if path = "/remove" then
         Cohttp_lwt_body.to_string body >>= fun b ->
@@ -213,6 +236,17 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
            let body = Printexc.to_string exn in
            HTTP.respond_error ~headers ~status:`Bad_request ~body ())
 
+      else if path = "/stats" then
+        let arr =
+          Hashtbl.fold (fun k v acc ->
+            let obj = ["cnt", Ezjsonm.int k; "time", Ezjsonm.int64 v] in
+            Ezjsonm.dict obj :: acc) tbl [] in
+        let () = Hashtbl.clear tbl in
+        let body =
+          arr |> Ezjsonm.(list value)
+          |> Ezjsonm.to_string
+          |> Cohttp_lwt_body.of_string in
+        HTTP.respond ~headers ~status:`OK ~body ()
       else
         HTTP.respond_error ~headers ~status:`Not_found ~body:"" ()
     in
@@ -226,7 +260,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
   let stubborn_insert_redirect t frame (src, dst) internal_ip final_endp =
     let other_xl_ip = internal_ip in
     let rec aux () =
-      let other_xl_port = get_fresh_port !internal_ports in
+      let other_xl_port = get_fresh_port internal_ports in
       let other_endp = other_xl_ip, other_xl_port in
       let open Nat_rewrite in
       add_redirect t frame other_endp final_endp >>= function
@@ -342,8 +376,8 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     Lwt.return conf
 
   let start pclock mclock _time pri sec http keys conduit resolver =
-    Logs.(set_level (Some Info));
-    Logs_reporter.(create pclock |> run) @@ fun () ->
+    (*Logs.(set_level (Some Info));
+    Logs_reporter.(create pclock |> run) @@ fun () ->*)
 
     tls_init keys >>= fun cfg ->
     let tcp = `TCP 8080 in
@@ -400,27 +434,6 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
       let sec_prefix = check_prefix internal_netmask internal_ip in
       with_filter_push sec_prefix sec_in_push in
 
-    (*
-    let heartbeat_liveness ip =
-      let module Client = Cohttp_mirage.Client in
-      let ctx = Client.ctx resolver conduit in
-      let host = gatekeeper_ip
-      and port = gatekeeper_port in
-      let path = Printf.sprintf "/alive/%s" ip in
-      let uri = Uri.make ~scheme:"http" ~host ~port ~path () in
-      Client.get ~ctx uri >>= fun (res, _) ->
-      let status = Cohttp.Response.status res in
-      if status = `OK then return_unit
-      else begin
-          let s = Cohttp.Code.string_of_status status in
-          Log.warn (fun f -> f "heartbeat liveness %s: %s" ip s);
-          return_unit end in
-
-    let rec heartbeat_loop () =
-      OS.Time.sleep 15.0 >>= fun () ->
-      heartbeat_liveness operation_ip >>= fun () ->
-      heartbeat_loop () in *)
-
     let () =
       Lwt.async_exception_hook := (fun exn ->
         Log.err (fun f -> f "async exception: %s" (Printexc.to_string exn))) in
@@ -458,7 +471,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
         send_packets_ip ext_i pri_out_queue;
         send_packets_ip int_i sec_out_queue;
 
-        http tcp @@ manage_entry (nat_t, Ipaddr.V4 external_ip) ();
+        http tcp @@ manage_entry (nat_t, Ipaddr.V4 external_ip, mclock) ();
       ]
 
   end
