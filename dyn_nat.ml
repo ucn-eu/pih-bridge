@@ -7,14 +7,16 @@ module Log = (val Logs.src_log src_log : Logs.LOG)
 
 module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     (PRI: NETWORK) (SEC: NETWORK)
-    (HTTP: Cohttp_lwt.Server) (KEYS: KV_RO)
+    (Stack: STACKV4) (*(HTTP: Cohttp_lwt.Server) (KEYS: KV_RO)*)
     (CONDUIT: Conduit_mirage.S) (RESOLVER: Resolver_lwt.S) = struct
 
   module Logs_reporter = Mirage_logs.Make(PClock)
 
+  module Http = Cohttp_mirage.Server(Stack.TCPV4)
+
   module ETH = Ethif.Make(PRI)
   module A = Arpv4.Make(ETH)(MClock)(Time)
-  module I = Ipv4.Make(ETH)(A)
+  module I = Static_ipv4.Make(ETH)(A)
   type direction = | Source | Destination
 
   (* acutally no usage
@@ -28,7 +30,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     let to_string_mac b = b |> Macaddr.of_bytes_exn |> Macaddr.to_string in
     let dmac = Ethif_wire.copy_ethernet_dst frame |> to_string_mac in
     let smac = Ethif_wire.copy_ethernet_src frame |> to_string_mac in
-    let v4_frame = Cstruct.shift frame Ethif_wire.sizeof_ethernet in
+    (*let v4_frame = Cstruct.shift frame Ethif_wire.sizeof_ethernet in*)
     Log.info (fun f -> f "[%s] MAC %s -> %s" fname smac dmac)
 
   let inspect_packet ~fname frame =
@@ -64,8 +66,11 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     PRI.listen netif
       (eth_input mac ethif
         ~arpv4:(A.input a)
-        ~ipv4:(fun frame ->
-          push (Some frame); return_unit))
+        ~ipv4:(fun frame -> push (Some frame); return_unit))
+    >>= function
+    | Ok () -> return_unit
+    | Error _ -> Log.err (fun f -> f "network error"); return_unit
+
 
   module PortSet = Set.Make(struct
     type t = Mirage_nat.port
@@ -74,12 +79,19 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
 
   let external_ports = ref PortSet.empty
   let internal_ports = ref PortSet.empty
-  let get_fresh_port set =
+  let get_fresh_port ?dst_ip set =
     let rec aux () =
       let p = Random.int 65535 in
       if p < 1024 || PortSet.mem p set then aux ()
       else p in
-    aux ()
+    match dst_ip with
+    | None -> aux ()
+    | Some ip ->
+       let ip_str = Ipaddr.to_string ip in
+       if ip_str = "192.168.252.11" then 10002
+       else if ip_str = "192.168.252.21" then 10003
+       else if ip_str = "192.168.252.22" then 10004
+       else aux ()
 
   let allow_nat_traffic table frame ip =
     let rec stubborn_insert table frame ip n =
@@ -127,7 +139,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
      real ip/port of the unikernel behind the NAT,
      so if a request is allowed after identify authentication, a ip/port pair on
      the external interface should be returned as connect point *)
-  let manage_entry (nat_t, external_ip) () =
+  let manage_entry (nat_t, external_ip) f =
     let callback (_,cid) req body =
       let uri = Cohttp.Request.uri req in
       let cid = Cohttp.Connection.to_string cid in
@@ -157,7 +169,8 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
             (Ipaddr.to_string dst_ip) dst_port);
           ip, (dst_ip, dst_port)) >>= fun (src_ip, final_dst) ->
 
-          let nat_dst_port = get_fresh_port !external_ports in
+          let dst_ip = fst final_dst in 
+          let nat_dst_port = get_fresh_port ~dst_ip !external_ports in
           Nat_rewrite.Table.add_entry nat_t ((src_ip, (external_ip, nat_dst_port)), final_dst) >>= fun () ->
           let body = Ezjsonm.([
             "ip",   external_ip |> Ipaddr.to_string |> string;
@@ -165,10 +178,10 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
              |> dict
              |> to_string
              |> Cohttp_lwt_body.of_string) in
-          HTTP.respond ~headers ~status:`OK ~body ())
+          Http.respond ~headers ~status:`OK ~body ())
           (fun exn ->
            let body = Printexc.to_string exn in
-           HTTP.respond_error ~headers ~status:`Bad_request ~body ())
+           Http.respond_error ~headers ~status:`Bad_request ~body ())
       else if path = "/remove" then
         Cohttp_lwt_body.to_string body >>= fun b ->
         Lwt.catch (fun () ->
@@ -208,19 +221,20 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
                Nat_rewrite.Table.delete nat_t Mirage_nat.Tcp ~external_lookup ~internal_lookup
                >|= ignore) ports
           >>= fun _ -> Nat_rewrite.Table.remove_source_ports nat_t (src_ip, destination)
-          >>= fun () -> HTTP.respond ~headers ~status:`OK ~body ())
+          >>= fun () -> Http.respond ~headers ~status:`OK ~body ())
           (fun exn ->
            let body = Printexc.to_string exn in
-           HTTP.respond_error ~headers ~status:`Bad_request ~body ())
+           Http.respond_error ~headers ~status:`Bad_request ~body ())
 
       else
-        HTTP.respond_error ~headers ~status:`Not_found ~body:"" ()
+        Http.respond_error ~headers ~status:`Not_found ~body:"" ()
     in
     let conn_closed (_,cid) =
       let cid = Cohttp.Connection.to_string cid in
       Log.info (fun f -> f "[%s] closing" cid)
     in
-    HTTP.make ~conn_closed ~callback ()
+    let t = Http.make ~conn_closed ~callback () in
+    Http.listen t f
 
 
   let stubborn_insert_redirect t frame (src, dst) internal_ip final_endp =
@@ -325,29 +339,27 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     | None -> ()
 
 
-  let check_prefix netmask addr frame =
+  let check_prefix nmask addr frame =
     let p = Cstruct.shift frame Ethif_wire.sizeof_ethernet in
     let dst = Ipv4_wire.get_ipv4_dst p |> Ipaddr.V4.of_int32 in
     let src = Ipv4_wire.get_ipv4_src p |> Ipaddr.V4.of_int32 in
-    let subnet = Ipaddr.V4.Prefix.of_netmask netmask addr in
-    Ipaddr.V4.Prefix.(mem dst subnet || mem src subnet)
+    (*let subnet = Ipaddr.V4.Prefix.of_netmask netmask addr in
+    Ipaddr.V4.Prefix.(mem dst subnet || mem src subnet)*)
+    Ipaddr.V4.Prefix.(mem dst nmask || mem src nmask)
 
-
-  module X509 = Tls_mirage.X509(KEYS)(Pclock)
+  (*
+  module X509 = Tls_mirage.X509(KEYS)(PClock)
 
 
   let tls_init kv =
     X509.certificate kv `Default >>= fun cert ->
     let conf = Tls.Config.server ~certificates:(`Single cert) () in
-    Lwt.return conf
+    Lwt.return conf*)
 
-  let start pclock mclock _time pri sec http keys conduit resolver =
-    Logs.(set_level (Some Info));
-    Logs_reporter.(create pclock |> run) @@ fun () ->
-
-    tls_init keys >>= fun cfg ->
-    let tcp = `TCP 8080 in
-    let tls = `TLS (cfg, `TCP 8443) in
+  let start pclock mclock _time pri sec stack conduit resolver =
+    (*tls_init keys >>= fun cfg ->*)
+    (*let tcp = `TCP 8080 in*)
+    (*let tls = `TLS (cfg, `TCP 8443) in*)
 
     let (pri_in_queue, pri_in_push) = Lwt_stream.create () in
     let (pri_out_queue, pri_out_push) = Lwt_stream.create () in
@@ -355,42 +367,52 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     let (sec_out_queue, sec_out_push) = Lwt_stream.create () in
 
     (* or_error brazenly stolen from netif-forward *)
-    let or_error name fn t =
+    (*let or_error name fn t =
       fn t
       >>= function
       | `Error e -> fail (Failure ("error starting " ^ name))
       | `Ok t -> Log.info (fun f -> f "%s connected." name);
                  return t
-    in
+    in*)
 
     (* get network configuration from bootvars *)
     let addr = Ipaddr.V4.of_string_exn in
+    let netmask = Ipaddr.V4.Prefix.of_string_exn in
+
     let internal_ip = addr @@ Key_gen.internal_ip () in
-    let internal_netmask = addr @@ Key_gen.internal_netmask () in
+    let internal_netmask = netmask @@ Key_gen.internal_netmask () in
     let external_ip = addr @@ Key_gen.external_ip () in
-    let external_netmask = addr @@ Key_gen.external_netmask () in
+    let external_netmask = netmask @@ Key_gen.external_netmask () in
     let external_gateway = addr @@ Key_gen.external_gateway () in
 
-    let operation_ip = Key_gen.operation_ip () in
+    (*let operation_ip = Key_gen.operation_ip () in
     let gatekeeper_ip = Key_gen.gatekeeper_ip () in
-    let gatekeeper_port = Key_gen.gatekeeper_port () in
+    let gatekeeper_port = Key_gen.gatekeeper_port () in*)
 
     (* initialize interfaces *)
-    or_error "primary interface" ETH.connect pri >>= fun ethif1 ->
-    or_error "secondary interface" ETH.connect sec >>= fun ethif2 ->
+    (*or_error "primary interface" ETH.connect pri >>= fun ethif1 ->
+    or_error "secondary interface" ETH.connect sec >>= fun ethif2 ->*)
+
+    ETH.connect pri >>= fun ethif1 ->
+    ETH.connect sec >>= fun ethif2 ->
+
 
     let arp_connect ethif = A.connect ethif mclock in
-    or_error "primary arp" arp_connect ethif1 >>= fun arp1 ->
-    or_error "secondary arp" arp_connect ethif2 >>= fun arp2 ->
+    (*or_error "primary arp" arp_connect ethif1 >>= fun arp1 ->
+    or_error "secondary arp" arp_connect ethif2 >>= fun arp2 ->*)
+    arp_connect ethif1 >>= fun arp1 ->
+    arp_connect ethif2 >>= fun arp2 ->
 
     (* set up ipv4 on interfaces so ARP will be answered *)
-    or_error "ip for primary interface" (I.connect ethif1) arp1 >>= fun ext_i ->
-    or_error "ip for secondary interface" (I.connect ethif2) arp2 >>= fun int_i ->
-    I.set_ip ext_i external_ip >>= fun () ->
+    (*or_error "ip for primary interface" (I.connect ethif1) arp1 >>= fun ext_i ->
+    or_error "ip for secondary interface" (I.connect ethif2) arp2 >>= fun int_i ->*)
+    I.connect ~ip:external_ip ~network:external_netmask ethif1 arp1 >>= fun ext_i ->
+    I.connect ~ip:internal_ip ~network:internal_netmask ~gateway:(Some external_gateway) ethif2 arp2 >>= fun int_i ->
+    (*I.set_ip ext_i external_ip >>= fun () ->
     I.set_ip_netmask ext_i external_netmask >>= fun () ->
     I.set_ip int_i internal_ip >>= fun () ->
     I.set_ip_netmask int_i internal_netmask >>= fun () ->
-    I.set_ip_gateways ext_i [ external_gateway ] >>= fun () ->
+    I.set_ip_gateways ext_i [ external_gateway ] >>= fun () ->*)
 
     let filtered_pri_in_push =
       let pri_prefix = check_prefix external_netmask external_ip in
@@ -433,6 +455,8 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     let conf = Mirage_nat_irmin.({resolver; conduit; uri = persist_uri; owner = "ucn.bridge"; now}) in
     Nat_rewrite.empty conf >>= fun nat_t ->
 
+    Stack.listen_tcpv4 stack ~port:8080 (manage_entry (nat_t, Ipaddr.V4 external_ip));
+    
     Lwt.choose [
         (* packet intake *)
         (listen pri ethif1 arp1 filtered_pri_in_push);
@@ -458,7 +482,8 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
         send_packets_ip ext_i pri_out_queue;
         send_packets_ip int_i sec_out_queue;
 
-        http tcp @@ manage_entry (nat_t, Ipaddr.V4 external_ip) ();
+        Stack.listen stack;
+        (*http tcp @@ manage_entry (nat_t, Ipaddr.V4 external_ip) ();*)
       ]
 
   end
