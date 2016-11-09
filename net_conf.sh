@@ -24,6 +24,12 @@ iptables -t nat -A POSTROUTING -o eth0 -s $MASQSRC -j MASQUERADE
 iptables -A PREROUTING -t nat -i eth0 -p tcp --dport 8443 -j DNAT --to 10.0.0.254:8443
 iptables -A FORWARD -p tcp -d 10.0.0.254 --dport 8080 -j ACCEPT
 
+iptables -A PREROUTING -t nat -i eth0 -p tcp --dport 10001 -j DNAT --to 10.0.0.2:10001
+iptables -A FORWARD -p tcp -d 10.0.0.2 --dport 10001 -j ACCEPT
+
+iptables -A PREROUTING -t nat -i eth0 -p tcp --dport 10002 -j DNAT --to 10.0.0.2:10002
+iptables -A FORWARD -p tcp -d 10.0.0.2 --dport 10002 -j ACCEPT
+
 iptables -A PREROUTING -t nat -i eth0 -p tcp --dport 10003 -j DNAT --to 10.0.0.2:10003
 iptables -A FORWARD -p tcp -d 10.0.0.2 --dport 10003 -j ACCEPT
 
