@@ -88,7 +88,8 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     | None -> aux ()
     | Some ip ->
        let ip_str = Ipaddr.to_string ip in
-       if ip_str = "192.168.252.11" then 10002
+       if ip_str = "192.168.252.10" then 10001
+       else if ip_str = "192.168.252.11" then 10002
        else if ip_str = "192.168.252.21" then 10003
        else if ip_str = "192.168.252.22" then 10004
        else aux ()
@@ -406,8 +407,8 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
     (* set up ipv4 on interfaces so ARP will be answered *)
     (*or_error "ip for primary interface" (I.connect ethif1) arp1 >>= fun ext_i ->
     or_error "ip for secondary interface" (I.connect ethif2) arp2 >>= fun int_i ->*)
-    I.connect ~ip:external_ip ~network:external_netmask ethif1 arp1 >>= fun ext_i ->
-    I.connect ~ip:internal_ip ~network:internal_netmask ~gateway:(Some external_gateway) ethif2 arp2 >>= fun int_i ->
+    I.connect ~ip:external_ip ~network:external_netmask ~gateway:(Some external_gateway) ethif1 arp1 >>= fun ext_i ->
+    I.connect ~ip:internal_ip ~network:internal_netmask ethif2 arp2 >>= fun int_i ->
     (*I.set_ip ext_i external_ip >>= fun () ->
     I.set_ip_netmask ext_i external_netmask >>= fun () ->
     I.set_ip int_i internal_ip >>= fun () ->
