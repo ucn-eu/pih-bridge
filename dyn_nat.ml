@@ -101,10 +101,15 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
       let open Nat_rewrite in
       add_nat table frame (ip, n) >>= function
       | Ok ->
+         Log.info (fun f -> f "add_nat OK!");
          external_ports := PortSet.add n !external_ports;
          Lwt.return (Some ())
-      | Unparseable -> Lwt.return None
-      | Overlap -> stubborn_insert table frame ip (get_fresh_port !external_ports)
+      | Unparseable ->
+         Log.warn (fun f -> f "add_nat Unparseable!");
+         Lwt.return None
+      | Overlap ->
+         Log.warn (fun f -> f "add_nat Overlap!");
+         stubborn_insert table frame ip (get_fresh_port !external_ports)
     in
     (* TODO: connection tracking logic *)
     stubborn_insert table frame ip (get_fresh_port !external_ports)

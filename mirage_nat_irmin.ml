@@ -62,6 +62,7 @@ module Storage : sig
   let empty {resolver; conduit; uri; owner; now} =
     let time = fun () -> now () |> Int64.to_string in
     let backend = `Http ((resolver, conduit, uri), owner) in
+    let backend = `Memory owner in
     S.make ~backend ~time () >>= fun s -> return (s, now)
 
   let store_of_t (t, _) = t
