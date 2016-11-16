@@ -41,7 +41,7 @@ type storage_config = {
     now      : unit -> int64;
   }
 
-module Storage : sig
+module type STORAGE = sig
     include Mirage_nat.Lookup with type config = storage_config
 
     val add_source_port: t -> mapping -> unit Lwt.t
@@ -51,7 +51,9 @@ module Storage : sig
     val add_entry: t -> (Ipaddr.t * endpoint) * endpoint -> unit Lwt.t
     val read_entry: t -> Ipaddr.t * endpoint -> endpoint option Lwt.t
     val remove_entry: t -> Ipaddr.t * endpoint -> unit Lwt.t
-  end = struct
+end
+
+module Storage : STORAGE = struct
 
   module S = Data_store
 
@@ -78,18 +80,18 @@ module Storage : sig
     let inbnd_path = to_entry trans.external_lookup trans.external_mapping in
     let inbnd_path = inbnd_dir @ inbnd_path in
 
-    S.create s inbnd_path expiration >|= (function
+    S.create s inbnd_path expiration >>= (function
     | Error exn ->
        let err = Printexc.to_string exn in
        Log.err (fun f -> f "insert %s failed: %s" (String.concat "/" inbnd_path) err);
-    | Ok () -> ()) >>= fun () ->
-
-    S.create s outbnd_path expiration >|= (function
-    | Error exn ->
-       Log.err (fun f -> f "insert failed: %s" (String.concat "/" inbnd_path));
-    | Ok () -> ()) >>= fun () ->
-
-    return_some (s, n)
+       return_none
+    | Ok () ->
+       S.create s outbnd_path expiration >>= (function
+       | Error exn ->
+          let err = Printexc.to_string exn in
+          Log.err (fun f -> f "insert %s failed: %s" (String.concat "/" outbnd_path) err);
+          return_none
+       | Ok () -> return_some (s, n)))
 
 
   let lookup (t, _) prot ~source ~destination =
@@ -195,7 +197,9 @@ module Storage : sig
     S.read t key >>= function
     | Ok value -> return_some @@ endpoint_of_string value
     | Error _ ->
-       Log.info (fun f -> f "read_entry: no value");
+       Log.info (fun f -> f "read_entry: no value %s -> %s"
+                            (Ipaddr.to_string src_ip)
+                            (string_of_endpoint dst));
        return_none
 
   let remove_entry (t, _) (src_ip, dst) =

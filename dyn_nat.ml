@@ -246,6 +246,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
       let open Nat_rewrite in
       add_redirect t frame other_endp final_endp >>= function
       | Ok ->
+         internal_ports := PortSet.add other_xl_port !internal_ports;
          Nat_rewrite.Table.add_source_port t (src, dst)
          (*entry_inserted pair;*)
       | Overlap -> aux ()
@@ -302,7 +303,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
          return (out_push (Some (dst, frame)))
       | Source, Untranslated ->
          Log.info (fun f -> f "add_nat_traffic");
-         inspect_frame ~fname:"nat" frame;
+         (*inspect_frame ~fname:"nat" frame;*)
          inspect_packet ~fname:"nat" frame;
         (* mutate nat_table to include entries for the frame *)
         allow_nat_traffic nat_table frame external_ip >>= function
@@ -322,7 +323,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
   let send_packets_ip i q =
     let fname = "send" in
     let aux (_, frame) =
-      inspect_frame ~fname frame;
+      (*inspect_frame ~fname frame;*)
       inspect_packet ~fname frame;
       I.writev i frame [] in
     let rec process () =
@@ -333,6 +334,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
   let with_filter_push check push = function
     | Some frame ->
        if check frame then begin
+           inspect_packet ~fname:"recv" frame;
            push (Some frame) end
        else ()(*begin
        Log.info (fun f -> f "fail the prefix check!");
