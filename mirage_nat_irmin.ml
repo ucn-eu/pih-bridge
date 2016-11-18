@@ -100,21 +100,28 @@ module Storage : STORAGE = struct
 
   let sanitize (s, n, q) =
     let rec aux () =
-      let path = Queue.peek q in
-      S.read s path >>= function
-      | Error exn ->
-         let err = Printexc.to_string exn in
-         Log.err (fun f -> f "read %s failed: %s" (String.concat "/" path) err);
-         aux ()
-      | Ok t ->
-         let now = n () in
-         let expiration = Int64.of_string t in
-         if Int64.compare expiration now < 0 then begin
-             Log.debug (fun f -> f "expiration removal: %s" (String.concat "/" path));
-             S.remove s path >>= function
-             | Error _ -> return_unit
-             | Ok () -> aux () end
-         else return_unit in
+      if Queue.is_empty q then return_unit
+      else
+        let path = Queue.peek q in
+        S.read s path >>= function
+        | Error exn ->
+           let err = Printexc.to_string exn in
+           Log.err (fun f -> f "read %s failed: %s" (String.concat "/" path) err);
+           let _ = Queue.pop q in
+           aux ()
+        | Ok t ->
+           let now = n () in
+           let expiration = Int64.of_string t in
+           Log.debug (fun f -> f "check expiration: %s <> %s (now)"
+                     (Int64.to_string expiration) (Int64.to_string now));
+           if Int64.compare expiration now < 0 then begin
+               S.remove s path >>= function
+               | Error _ -> return_unit
+               | Ok () ->
+                  Log.debug (fun f -> f "expiration removal: %s" (String.concat "/" path));
+                  let _ = Queue.pop q in
+                  aux () end
+           else return_unit in
     aux ()
 
 

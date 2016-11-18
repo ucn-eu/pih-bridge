@@ -82,7 +82,7 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
   let get_fresh_port ?dst_ip set =
     let rec aux () =
       let p = Random.int 65535 in
-      if p < 1024 || PortSet.mem p set then aux ()
+      if p < 1024 then aux ()
       else p in
     match dst_ip with
     | None -> aux ()
@@ -104,7 +104,10 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
          external_ports := PortSet.add n !external_ports;
          Lwt.return (Some ())
       | Unparseable -> Lwt.return None
-      | Overlap -> stubborn_insert table frame ip (get_fresh_port !external_ports)
+      | Overlap ->
+         Log.info (fun f -> f "stubborn_insert result Overlap: %s %d"
+                  (Ipaddr.to_string ip) n);
+         stubborn_insert table frame ip (get_fresh_port !external_ports)
     in
     (* TODO: connection tracking logic *)
     stubborn_insert table frame ip (get_fresh_port !external_ports)
@@ -249,7 +252,10 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
          internal_ports := PortSet.add other_xl_port !internal_ports;
          Nat_rewrite.Table.add_source_port t (src, dst)
          (*entry_inserted pair;*)
-      | Overlap -> aux ()
+      | Overlap ->
+         Log.info (fun f -> f "stubborn_insert_redirect result Overlap: %s %d"
+                              (Ipaddr.to_string other_xl_ip) other_xl_port);
+         aux ()
       | Unparseable -> Lwt.fail (Failure "unparseable frame") in
     aux ()
 
@@ -302,17 +308,16 @@ module Main (PClock: V1.PCLOCK) (MClock: V1.MCLOCK) (Time: V1_LWT.TIME)
       | Source, (Translated dst) ->
          return (out_push (Some (dst, frame)))
       | Source, Untranslated ->
-         Log.info (fun f -> f "add_nat_traffic");
          (*inspect_frame ~fname:"nat" frame;*)
          inspect_packet ~fname:"nat" frame;
-        (* mutate nat_table to include entries for the frame *)
-        allow_nat_traffic nat_table frame external_ip >>= function
-        | Some () ->
-          (* try rewriting again; we should now have an entry for this packet *)
-          aux frame
-        | None ->
-          (* this frame is hopeless! *)
-          return_unit
+         (* mutate nat_table to include entries for the frame *)
+         allow_nat_traffic nat_table frame external_ip >>= function
+         | Some () ->
+            (* try rewriting again; we should now have an entry for this packet *)
+            aux frame
+         | None ->
+            (* this frame is hopeless! *)
+            return_unit
     in
     let rec process () =
       Lwt_stream.next in_queue >>= aux >>= process
